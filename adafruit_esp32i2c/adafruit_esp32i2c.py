@@ -46,9 +46,11 @@ import struct
 import time
 from micropython import const
 from digitalio import Direction
+import busio, board
+
 from adafruit_bus_device.spi_device import SPIDevice
 
-// FIXME mcj
+# FIXME mcj
 from adafruit_bus_device.i2c_device import I2CDevice
 
 __version__ = "0.0.0-auto.0"
@@ -127,7 +129,7 @@ WL_AP_CONNECTED       = const(8)
 WL_AP_FAILED          = const(9)
 # pylint: enable=bad-whitespace
 
-class ESP_SPIcontrol:  # pylint: disable=too-many-public-methods
+class ESP_I2Ccontrol:  # pylint: disable=too-many-public-methods
     """A class that will talk to an ESP32 module programmed with special firmware
     that lets it act as a fast an efficient WiFi co-processor"""
     TCP_MODE = const(0)
@@ -140,25 +142,25 @@ class ESP_SPIcontrol:  # pylint: disable=too-many-public-methods
         # FIXME mcj Hack
         self._addr = 0x2A
         self._i2c = busio.I2C(board.SCL, board.SDA)
-        self._device =  I2CDevice(i2c, ADDR)
+        self._device =  I2CDevice(self._i2c, self._addr)
 
         self._debug = debug
         self._buffer = bytearray(10)
         self._pbuf = bytearray(1)  # buffer for param read
         self._sendbuf = bytearray(256)  # buffer for command sending
         self._socknum_ll = [[0]]      # pre-made list of list of socket #
-        # FIXME mcj
-        # self._spi_device = SPIDevice(spi, cs_pin, baudrate=8000000)
+
+        self._spi_device = SPIDevice(spi, cs_pin, baudrate=8000000)
         self._cs = cs_pin
         self._ready = ready_pin
         self._reset = reset_pin
         self._gpio0 = gpio0_pin
-        self._cs.direction = Direction.OUTPUT
-        self._ready.direction = Direction.INPUT
-        self._reset.direction = Direction.OUTPUT
-        if self._gpio0:
-            self._gpio0.direction = Direction.INPUT
-        self.reset()
+        #self._cs.direction = Direction.OUTPUT
+        #self._ready.direction = Direction.INPUT
+        #self._reset.direction = Direction.OUTPUT
+        #if self._gpio0:
+        #    self._gpio0.direction = Direction.INPUT
+        # self.reset()
     # pylint: enable=too-many-arguments
 
     def reset(self):
@@ -321,8 +323,8 @@ class ESP_SPIcontrol:  # pylint: disable=too-many-public-methods
         self._send_command(cmd, params, param_len_16=sent_param_len_16)
         # FIXME mcj
         # Need to implement response.
-        # Looks like I need a zero, doubly nested, to fool the functions.
-        return [[0]] # self._wait_response_cmd(cmd, reply_params, param_len_16=recv_param_len_16)
+        # Looks like I need a one, doubly nested, to fool the functions.
+        return [[1]] # self._wait_response_cmd(cmd, reply_params, param_len_16=recv_param_len_16)
 
     @property
     def status(self):

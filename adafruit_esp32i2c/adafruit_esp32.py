@@ -129,7 +129,66 @@ WL_AP_CONNECTED       = const(8)
 WL_AP_FAILED          = const(9)
 # pylint: enable=bad-whitespace
 
-class ESP_I2Ccontrol:  # pylint: disable=too-many-public-methods
+class Protocol:
+    params = None
+    
+    # Protocols should override the init for any additional init they need to do.
+    def __init__(self, dict_of_params, ready_pin=None, reset_pin=None, gpio0_pin=None, *, debug=False):
+        self._params = dict_of_params
+        self._ready = ready_pin
+        self._reset = reset_pin
+        self._gpio0 = gpio0_pin
+        self._debug = debug
+        self._setup_pins()
+        # FIXME
+        # There should be a reset of the ESP32 after the pins are set up.
+        # self.reset()
+
+    # Protocols should override this to set up any additional
+    # pins from the *pins* list.
+    def _setup_pins(self):
+        if self._gpio0:
+            self._gpio0.direction = Direction.INPUT    
+        if self._ready:
+            self._ready.direction = Direction.INPUT
+        if self._reset:
+            self._reset.direction = Direction.OUTPUT
+        
+    # Every protocol must implement a way to send a buffer.
+    def _send_buffer(self, buffer, start, end):
+        pass
+
+class SPI(Protocol):
+    def _setup_pins(self):
+        if self._debug > 3:
+            print("SPI Calling super._setup_pins()")    
+        self._cs = self._params['CS']
+        self._ready = proto._ready
+        self._reset = proto._reset
+        self._gpio0 = proto._gpio
+        self._cs.direction    = Direction.OUTPUT
+        self._ready.direction = Direction.INPUT
+        self._spi_device = SPIDevice(spi, cs_pin, baudrate=8000000)
+    def send_buffer(self, buffer, start, end):
+        spi.write(buffer, start=start, end=end)  # pylint: disable=no-member
+
+class I2C(Protocol):
+    def _setup_pins(self):
+        if self._debug > 3:
+            print("I2C Calling super._setup_pins()")            
+        super()._setup_pins()
+        self._addr = self._params['address']
+        self._scl  = self._params['SCL']
+        self._sda  = self._params['SDA']
+        self._i2c  = busio.I2C(self._scl, self._sda)
+        self._device =  I2CDevice(self._i2c, self._addr)
+
+    def send_buffer(self, buffer, start, end):
+        with self._device:
+            self._device.write(buffer, start=start, end=end, stop=True)
+
+
+class ESP_Control:  # pylint: disable=too-many-public-methods
     """A class that will talk to an ESP32 module programmed with special firmware
     that lets it act as a fast an efficient WiFi co-processor"""
     TCP_MODE = const(0)
@@ -137,30 +196,20 @@ class ESP_I2Ccontrol:  # pylint: disable=too-many-public-methods
     TLS_MODE = const(2)
 
     # pylint: disable=too-many-arguments
-    def __init__(self, spi, cs_pin, ready_pin, reset_pin, gpio0_pin=None, *, debug=False):
+    def __init__(self, proto):
+        self._buffer     = bytearray(10)
+        self._pbuf       = bytearray(1)    # buffer for param read
+        self._sendbuf    = bytearray(256)  # buffer for command sending
+        self._socknum_ll = [[0]]           # pre-made list of list of socket #
         
-        # FIXME mcj Hack
-        self._addr = 0x2A
-        self._i2c = busio.I2C(board.SCL, board.SDA)
-        self._device =  I2CDevice(self._i2c, self._addr)
+        # FIXME: These should not be copied out of the proto object,
+        # really. However, it saves modifying more code.
+        self._proto = proto
+        self._debug = proto._debug
+        self._ready = proto._ready
+        self._reset = proto._reset
+        self._gpio0 = proto._gpio0
 
-        self._debug = debug
-        self._buffer = bytearray(10)
-        self._pbuf = bytearray(1)  # buffer for param read
-        self._sendbuf = bytearray(256)  # buffer for command sending
-        self._socknum_ll = [[0]]      # pre-made list of list of socket #
-
-        self._spi_device = SPIDevice(spi, cs_pin, baudrate=8000000)
-        self._cs = cs_pin
-        self._ready = ready_pin
-        self._reset = reset_pin
-        self._gpio0 = gpio0_pin
-        #self._cs.direction = Direction.OUTPUT
-        #self._ready.direction = Direction.INPUT
-        #self._reset.direction = Direction.OUTPUT
-        #if self._gpio0:
-        #    self._gpio0.direction = Direction.INPUT
-        # self.reset()
     # pylint: enable=too-many-arguments
 
     def reset(self):
@@ -235,18 +284,19 @@ class ESP_I2Ccontrol:  # pylint: disable=too-many-public-methods
         # Add the wait_for_ready back in.
         # self._wait_for_ready()
         # with self._spi_device as spi:
-        with self._device:
-            times = time.monotonic()
-            while (time.monotonic() - times) < 1: # wait up to 1000ms
-                if 1: # FIXME self._ready.value:  # ok ready to send!
-                    break
-            else:
-                raise RuntimeError("ESP32 timed out on SPI select")
-            # spi.write(self._sendbuf, start=0, end=packet_len)  # pylint: disable=no-member
-            self._device.write(self._sendbuf, start = 0, end = packet_len, stop = True)
+        # with self._device:
+        times = time.monotonic()
+        while (time.monotonic() - times) < 1: # wait up to 1000ms
+            if 1: # FIXME self._ready.value:  # ok ready to send!
+                break
+        else:
+            raise RuntimeError("ESP32 timed out on SPI select")
+        # spi.write(self._sendbuf, start=0, end=packet_len)  # pylint: disable=no-member
+        # self._device.write(self._sendbuf, start = 0, end = packet_len, stop = True)
+        self._proto.send_buffer(self._sendbuf, start=0, end=packet_len)
 
-            if self._debug >= 3:
-                print("Wrote: ", [hex(b) for b in self._sendbuf[0:packet_len]])
+        if self._debug >= 3:
+            print("Wrote: ", [hex(b) for b in self._sendbuf[0:packet_len]])
     # pylint: disable=too-many-branches
 
     def _read_byte(self, spi):

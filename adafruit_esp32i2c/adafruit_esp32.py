@@ -169,24 +169,38 @@ class SPI(Protocol):
         self._cs.direction    = Direction.OUTPUT
         self._ready.direction = Direction.INPUT
         self._spi_device = SPIDevice(spi, cs_pin, baudrate=8000000)
+    
+    # FIXME
+    # These can be abstracted further. The Adafruit bus 
+    # devices both have write() and readinto() methods.
     def send_buffer(self, buffer, start, end):
-        spi.write(buffer, start=start, end=end)  # pylint: disable=no-member
+        # FIXME:
+        # SPI needs to be fixed/reassembled. Currently untested.
+        with self._spi_device as spi:
+            spi.write(buffer, start=start, end=end)  # pylint: disable=no-member
 
+    def readinto(self, buff, start=0, end=1):
+        with self._spi_device as spi:
+            spi.readinto(buff)
+        
 class I2C(Protocol):
     def _setup_pins(self):
         if self._debug > 3:
             print("I2C Calling super._setup_pins()")            
         super()._setup_pins()
-        self._addr = self._params['address']
-        self._scl  = self._params['SCL']
-        self._sda  = self._params['SDA']
-        self._i2c  = busio.I2C(self._scl, self._sda)
-        self._device =  I2CDevice(self._i2c, self._addr)
+        self._addr   = self._params['address']
+        self._scl    = self._params['SCL']
+        self._sda    = self._params['SDA']
+        self._i2c    = busio.I2C(self._scl, self._sda)
+        self._device = I2CDevice(self._i2c, self._addr)
 
     def send_buffer(self, buffer, start, end):
-        with self._device:
-            self._device.write(buffer, start=start, end=end, stop=True)
-
+        with self._device as device:
+            device.write(buffer, start=start, end=end, stop=True)
+    
+    def readinto(self, buff, start=0, end=1):
+        with self._device as device:
+            device.readinto(buff, start=start, end=end)
 
 class ESP_Control:  # pylint: disable=too-many-public-methods
     """A class that will talk to an ESP32 module programmed with special firmware
@@ -209,7 +223,6 @@ class ESP_Control:  # pylint: disable=too-many-public-methods
         self._ready = proto._ready
         self._reset = proto._reset
         self._gpio0 = proto._gpio0
-
     # pylint: enable=too-many-arguments
 
     def reset(self):
@@ -229,6 +242,10 @@ class ESP_Control:  # pylint: disable=too-many-public-methods
 
     def _wait_for_ready(self):
         """Wait until the ready pin goes low"""
+        # FIXME HACK
+        time.sleep(0.05)
+        return True
+
         if self._debug >= 3:
             print("Wait for ESP32 ready", end='')
         times = time.monotonic()
@@ -282,85 +299,97 @@ class ESP_Control:  # pylint: disable=too-many-public-methods
 
         # FIXME mcj 
         # Add the wait_for_ready back in.
-        # self._wait_for_ready()
-        # with self._spi_device as spi:
-        # with self._device:
-        times = time.monotonic()
-        while (time.monotonic() - times) < 1: # wait up to 1000ms
-            if 1: # FIXME self._ready.value:  # ok ready to send!
-                break
-        else:
-            raise RuntimeError("ESP32 timed out on SPI select")
-        # spi.write(self._sendbuf, start=0, end=packet_len)  # pylint: disable=no-member
-        # self._device.write(self._sendbuf, start = 0, end = packet_len, stop = True)
+        self._wait_for_ready()
+        
+        # 20140714 MCJ
+        # It is unclear why a _wait_for_ready() happens, followed by
+        # a re-implementation of _wait_for_ready(). I know it says 
+        # that we're waiting for a SPI select... but, we just waited
+        # for the ready pin to drop. Nothing changes between that call
+        # and this block of code. I'm removing it for now.
+
+        # times = time.monotonic()
+        # while (time.monotonic() - times) < 1: # wait up to 1000ms
+        #     if 1: # FIXME self._ready.value:  # ok ready to send!
+        #         break
+        # else:
+        #     raise RuntimeError("ESP32 timed out on SPI select")
+        
         self._proto.send_buffer(self._sendbuf, start=0, end=packet_len)
 
         if self._debug >= 3:
             print("Wrote: ", [hex(b) for b in self._sendbuf[0:packet_len]])
     # pylint: disable=too-many-branches
 
-    def _read_byte(self, spi):
-        """Read one byte from SPI"""
-        spi.readinto(self._pbuf)
+    def _read_byte(self):
+        """Read one byte from the protocol."""
+        self._proto.readinto(self._pbuf)
         if self._debug >= 3:
             print("\t\tRead:", hex(self._pbuf[0]))
         return self._pbuf[0]
-
-    def _read_bytes(self, spi, buffer, start=0, end=None):
+    
+    # 20190714 MCJ
+    # Removed the protocol from the formal parameters.
+    # Now carried as _proto in the class.
+    def _read_bytes(self, buffer, start=0, end=None):
         """Read many bytes from SPI"""
         if not end:
             end = len(buffer)
-        spi.readinto(buffer, start=start, end=end)
+        self._proto.readinto(buffer, start=start, end=end)
         if self._debug >= 3:
             print("\t\tRead:", [hex(i) for i in buffer])
 
-    def _wait_spi_char(self, spi, desired):
+    # 20190714 MCJ
+    # Was _wait_spi_char. Removed the proto from the formals.
+    # Now abstracted over the protocol.
+    def _wait_char(self, desired):
         """Read a byte with a time-out, and if we get it, check that its what we expect"""
         times = time.monotonic()
         while (time.monotonic() - times) < 0.1:
-            r = self._read_byte(spi)
+            r = self._read_byte()
             if r == _ERR_CMD:
                 raise RuntimeError("Error response to command")
             if r == desired:
                 return True
-        raise RuntimeError("Timed out waiting for SPI char")
+        raise RuntimeError("Timed out waiting for char")
 
-    def _check_data(self, spi, desired):
+    def _check_data(self, desired):
         """Read a byte and verify its the value we want"""
-        r = self._read_byte(spi)
+        r = self._read_byte()
         if r != desired:
             raise RuntimeError("Expected %02X but got %02X" % (desired, r))
 
     def _wait_response_cmd(self, cmd, num_responses=None, *, param_len_16=False):
         """Wait for ready, then parse the response"""
         self._wait_for_ready()
-
         responses = []
-        with self._spi_device as spi:
-            times = time.monotonic()
-            while (time.monotonic() - times) < 1: # wait up to 1000ms
-                if self._ready.value:  # ok ready to send!
-                    break
-            else:
-                raise RuntimeError("ESP32 timed out on SPI select")
+        
+        # 20190714 MCJ
+        # This is redundant with the _wait_for_ready() call above.
+        # times = time.monotonic()
+        # while (time.monotonic() - times) < 1: # wait up to 1000ms
+        #     if self._ready.value:  # ok ready to send!
+        #         break
+        # else:
+        #     raise RuntimeError("ESP32 timed out on SPI select")
 
-            self._wait_spi_char(spi, _START_CMD)
-            self._check_data(spi, cmd | _REPLY_FLAG)
-            if num_responses is not None:
-                self._check_data(spi, num_responses)
-            else:
-                num_responses = self._read_byte(spi)
-            for num in range(num_responses):
-                param_len = self._read_byte(spi)
-                if param_len_16:
-                    param_len <<= 8
-                    param_len |= self._read_byte(spi)
-                if self._debug >= 2:
-                    print("\tParameter #%d length is %d" % (num, param_len))
-                response = bytearray(param_len)
-                self._read_bytes(spi, response)
-                responses.append(response)
-            self._check_data(spi, _END_CMD)
+        self._wait_char(_START_CMD)
+        self._check_data(cmd | _REPLY_FLAG)
+        if num_responses is not None:
+            self._check_data(num_responses)
+        else:
+            num_responses = self._read_byte()
+        for num in range(num_responses):
+            param_len = self._read_byte()
+            if param_len_16:
+                param_len <<= 8
+                param_len |= self._read_byte()
+            if self._debug >= 2:
+                print("\tParameter #%d length is %d" % (num, param_len))
+            response = bytearray(param_len)
+            self._read_bytes(response)
+            responses.append(response)
+        self._check_data(_END_CMD)
 
         if self._debug >= 2:
             print("Read %d: " % len(responses[0]), responses)
@@ -369,12 +398,14 @@ class ESP_Control:  # pylint: disable=too-many-public-methods
     def _send_command_get_response(self, cmd, params=None, *,
                                    reply_params=1, sent_param_len_16=False,
                                    recv_param_len_16=False):
-        """Send a high level SPI command, wait and return the response"""
+        """Send a high level command, wait and return the response"""
         self._send_command(cmd, params, param_len_16=sent_param_len_16)
         # FIXME mcj
         # Need to implement response.
         # Looks like I need a one, doubly nested, to fool the functions.
-        return [[1]] # self._wait_response_cmd(cmd, reply_params, param_len_16=recv_param_len_16)
+        # Original return value:
+        return self._wait_response_cmd(cmd, reply_params, param_len_16=recv_param_len_16)
+        
 
     @property
     def status(self):

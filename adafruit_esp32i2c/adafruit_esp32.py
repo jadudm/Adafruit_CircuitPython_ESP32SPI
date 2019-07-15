@@ -60,6 +60,7 @@ __repo__ = "https://github.com/adafruit/Adafruit_CircuitPython_ESP32SPI.git"
 _SET_NET_CMD           = const(0x10)
 _SET_PASSPHRASE_CMD    = const(0x11)
 _SET_DEBUG_CMD         = const(0x1A)
+_GET_TEMPERATURE_CMD   = const(0x1B)
 
 _GET_CONN_STATUS_CMD   = const(0x20)
 _GET_IPADDR_CMD        = const(0x21)
@@ -133,16 +134,13 @@ class Protocol:
     params = None
     
     # Protocols should override the init for any additional init they need to do.
-    def __init__(self, dict_of_params, ready_pin=None, reset_pin=None, gpio0_pin=None, *, debug=False):
+    def __init__(self, dict_of_params, *, ready_pin=None, reset_pin=None, gpio0_pin=None, debug=False):
         self._params = dict_of_params
         self._ready = ready_pin
         self._reset = reset_pin
         self._gpio0 = gpio0_pin
         self._debug = debug
         self._setup_pins()
-        # FIXME
-        # There should be a reset of the ESP32 after the pins are set up.
-        # self.reset()
 
     # Protocols should override this to set up any additional
     # pins from the *pins* list.
@@ -160,7 +158,7 @@ class Protocol:
 
 class SPI(Protocol):
     def _setup_pins(self):
-        if self._debug > 3:
+        if self._debug >=3:
             print("SPI Calling super._setup_pins()")    
         self._cs = self._params['CS']
         self._ready = proto._ready
@@ -168,6 +166,8 @@ class SPI(Protocol):
         self._gpio0 = proto._gpio
         self._cs.direction    = Direction.OUTPUT
         self._ready.direction = Direction.INPUT
+    
+    def _setup_device(self):
         self._spi_device = SPIDevice(spi, cs_pin, baudrate=8000000)
     
     # FIXME
@@ -185,22 +185,30 @@ class SPI(Protocol):
         
 class I2C(Protocol):
     def _setup_pins(self):
-        if self._debug > 3:
+        if self._debug >= 3:
             print("I2C Calling super._setup_pins()")            
         super()._setup_pins()
         self._addr   = self._params['address']
         self._scl    = self._params['SCL']
         self._sda    = self._params['SDA']
+    
+    def _setup_device(self):
         self._i2c    = busio.I2C(self._scl, self._sda)
         self._device = I2CDevice(self._i2c, self._addr)
 
     def send_buffer(self, buffer, start, end):
+        # 20190715 MCJ
+        # Sending a stop bit is, apparently, a Bad Idea.
+        # The ESP32 decides (after... some commands?...)
+        # to stop transacting. Because there are abstractions at both ends,
+        # it is unclear what the impact/effect of the stop bit is.
         with self._device as device:
-            device.write(buffer, start=start, end=end, stop=True)
+           device.write(buffer, start=start, end=end, stop=False)
     
     def readinto(self, buff, start=0, end=1):
         with self._device as device:
             device.readinto(buff, start=start, end=end)
+
 
 class ESP_Control:  # pylint: disable=too-many-public-methods
     """A class that will talk to an ESP32 module programmed with special firmware
@@ -208,6 +216,8 @@ class ESP_Control:  # pylint: disable=too-many-public-methods
     TCP_MODE = const(0)
     UDP_MODE = const(1)
     TLS_MODE = const(2)
+    ESP_BUSY = True
+    ESP_READY  = False
 
     # pylint: disable=too-many-arguments
     def __init__(self, proto):
@@ -223,7 +233,12 @@ class ESP_Control:  # pylint: disable=too-many-public-methods
         self._ready = proto._ready
         self._reset = proto._reset
         self._gpio0 = proto._gpio0
+        self.reset()
+        self._proto._setup_device()
+
     # pylint: enable=too-many-arguments
+    def set_debug_level(self, lvl):
+        self._debug = lvl
 
     def reset(self):
         """Hard reset the ESP32 using the reset pin"""
@@ -232,25 +247,24 @@ class ESP_Control:  # pylint: disable=too-many-public-methods
         if self._gpio0:
             self._gpio0.direction = Direction.OUTPUT
             self._gpio0.value = True  # not bootload mode
-        self._cs.value = True
+        if hasattr(self, "_cs"):
+            self._cs.value = True
         self._reset.value = False
         time.sleep(0.01)    # reset
         self._reset.value = True
-        time.sleep(0.75)    # wait for it to boot up
+        # 20190715 MCJ
+        # Was 0.75 for boot time.
+        time.sleep(1.25)    # wait for it to boot up
         if self._gpio0:
             self._gpio0.direction = Direction.INPUT
 
-    def _wait_for_ready(self):
+    def _wait_for_pin_level(self, level, timeout):
         """Wait until the ready pin goes low"""
-        # FIXME HACK
-        time.sleep(0.05)
-        return True
-
         if self._debug >= 3:
-            print("Wait for ESP32 ready", end='')
+            print("in _wait_for_level({0}, {1}) == {2}".format(level, timeout, self._ready.value), end='')
         times = time.monotonic()
-        while (time.monotonic() - times) < 10:  # wait up to 10 seconds
-            if not self._ready.value: # we're ready!
+        while (time.monotonic() - times) < timeout:  # wait up to 10 seconds
+            if (self._ready.value == level): # we're ready!
                 break
             if self._debug >= 3:
                 print('.', end='')
@@ -258,7 +272,9 @@ class ESP_Control:  # pylint: disable=too-many-public-methods
         else:
             raise RuntimeError("ESP32 not responding")
         if self._debug >= 3:
+            print("\tESP32 is ready.")
             print()
+
 
     # pylint: disable=too-many-branches
     def _send_command(self, cmd, params=None, *, param_len_16=False):
@@ -274,6 +290,7 @@ class ESP_Control:  # pylint: disable=too-many-public-methods
                 packet_len += 1        # 2 of em here!
         while packet_len % 4 != 0:
             packet_len += 1
+
         # we may need more space
         if packet_len > len(self._sendbuf):
             self._sendbuf = bytearray(packet_len)
@@ -297,11 +314,15 @@ class ESP_Control:  # pylint: disable=too-many-public-methods
             ptr += len(param)
         self._sendbuf[ptr] = _END_CMD
 
-        # FIXME mcj 
-        # Add the wait_for_ready back in.
-        self._wait_for_ready()
-        
-        # 20140714 MCJ
+        # 20190715 MCJ
+        # So, it turns out the block of code I commented out waited 
+        # for the pin to go high after waiting for the pin to go low.
+        # self._wait_for_pin_level(self.LOW, 10)
+
+        # 20190715 MCJ
+        # I have no idea why the block below was written. It seems wrong.
+        # self._wait_for_pin_level(self.HIGH, 1)    
+        # 20190714 MCJ
         # It is unclear why a _wait_for_ready() happens, followed by
         # a re-implementation of _wait_for_ready(). I know it says 
         # that we're waiting for a SPI select... but, we just waited
@@ -310,7 +331,7 @@ class ESP_Control:  # pylint: disable=too-many-public-methods
 
         # times = time.monotonic()
         # while (time.monotonic() - times) < 1: # wait up to 1000ms
-        #     if 1: # FIXME self._ready.value:  # ok ready to send!
+        #     if self._ready.value:  # ok ready to send!
         #         break
         # else:
         #     raise RuntimeError("ESP32 timed out on SPI select")
@@ -325,7 +346,7 @@ class ESP_Control:  # pylint: disable=too-many-public-methods
         """Read one byte from the protocol."""
         self._proto.readinto(self._pbuf)
         if self._debug >= 3:
-            print("\t\tRead:", hex(self._pbuf[0]))
+            print("\t\t_read_byte(): ", hex(self._pbuf[0]))
         return self._pbuf[0]
     
     # 20190714 MCJ
@@ -337,15 +358,19 @@ class ESP_Control:  # pylint: disable=too-many-public-methods
             end = len(buffer)
         self._proto.readinto(buffer, start=start, end=end)
         if self._debug >= 3:
-            print("\t\tRead:", [hex(i) for i in buffer])
+            print("\t\t_read_bytes(): ", [hex(i) for i in buffer])
 
     # 20190714 MCJ
     # Was _wait_spi_char. Removed the proto from the formals.
     # Now abstracted over the protocol.
     def _wait_char(self, desired):
         """Read a byte with a time-out, and if we get it, check that its what we expect"""
+        if self._debug >= 3:
+            print("\t\t_wait_char({0})".format(hex(desired)))
         times = time.monotonic()
-        while (time.monotonic() - times) < 0.1:
+        # 20190715 MCJ
+        # Was 0.1
+        while (time.monotonic() - times) < 1:
             r = self._read_byte()
             if r == _ERR_CMD:
                 raise RuntimeError("Error response to command")
@@ -361,9 +386,8 @@ class ESP_Control:  # pylint: disable=too-many-public-methods
 
     def _wait_response_cmd(self, cmd, num_responses=None, *, param_len_16=False):
         """Wait for ready, then parse the response"""
-        self._wait_for_ready()
-        responses = []
         
+        responses = []
         # 20190714 MCJ
         # This is redundant with the _wait_for_ready() call above.
         # times = time.monotonic()
@@ -399,12 +423,14 @@ class ESP_Control:  # pylint: disable=too-many-public-methods
                                    reply_params=1, sent_param_len_16=False,
                                    recv_param_len_16=False):
         """Send a high level command, wait and return the response"""
+        
+        self._wait_for_pin_level(self.ESP_READY, 10)
         self._send_command(cmd, params, param_len_16=sent_param_len_16)
-        # FIXME mcj
-        # Need to implement response.
-        # Looks like I need a one, doubly nested, to fool the functions.
-        # Original return value:
-        return self._wait_response_cmd(cmd, reply_params, param_len_16=recv_param_len_16)
+
+        self._wait_for_pin_level(self.ESP_READY, 10)
+        response = self._wait_response_cmd(cmd, reply_params, param_len_16=recv_param_len_16)
+
+        return response
         
 
     @property
@@ -433,14 +459,19 @@ class ESP_Control:  # pylint: disable=too-many-public-methods
         """A bytearray containing the MAC address of the ESP32"""
         if self._debug:
             print("MAC address")
-        resp = self._send_command_get_response(_GET_MACADDR_CMD, [b'\xFF'])
+        # 20190715 MCJ
+        # The parameters being passed were [b'\xFF'].
+        # This makes no sense, because the MAC address command on
+        # the ESP32 does not take any parameters. Hence, no parameters
+        # should be passed here.
+        resp = self._send_command_get_response(_GET_MACADDR_CMD, None)
         return resp[0]
 
     def start_scan_networks(self):
         """Begin a scan of visible access points. Follow up with a call
         to 'get_scan_networks' for response"""
         if self._debug:
-            print("Start scan")
+            print("Starting scan - no-op in firmware")
         resp = self._send_command_get_response(_START_SCAN_NETWORKS)
         if resp[0][0] != 1:
             raise RuntimeError("Failed to start AP scan")
@@ -448,6 +479,9 @@ class ESP_Control:  # pylint: disable=too-many-public-methods
     def get_scan_networks(self):
         """The results of the latest SSID scan. Returns a list of dictionaries with
         'ssid', 'rssi' and 'encryption' entries, one for each AP found"""
+        if self._debug >= 3:
+            print("get_scan_networks")
+
         self._send_command(_SCAN_NETWORKS)
         names = self._wait_response_cmd(_SCAN_NETWORKS)
         #print("SSID names:", names)
@@ -466,7 +500,11 @@ class ESP_Control:  # pylint: disable=too-many-public-methods
          Returns a list of dictionaries with 'ssid', 'rssi' and 'encryption' entries,
          one for each AP found"""
         self.start_scan_networks()
+        if self._debug >= 3:
+            print("start_scan_networks() complete.")
         for _ in range(10):  # attempts
+            if self._debug >= 3:
+                print("Scan attempt number {0}".format(_))
             time.sleep(2)
             APs = self.get_scan_networks() # pylint: disable=invalid-name
             if APs:
@@ -771,3 +809,11 @@ class ESP_Control:  # pylint: disable=too-many-public-methods
                                                ((pin,), (value,)))
         if resp[0][0] != 1:
             raise RuntimeError("Failed to write to pin")
+    
+    @property
+    def temperature(self):
+        print("Getting the temperature")
+        resp = self._send_command_get_response(_GET_TEMPERATURE_CMD, ())
+        return resp
+
+# e0 a2 01 06 00 00 00 00 00 00 ee
